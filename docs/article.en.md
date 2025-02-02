@@ -1,375 +1,332 @@
-A story about how we added fast bus scanning, events, and address collision resolution to Modbus.
-
-From the article you will learn why we needed this, what problems we encountered in the process and what we ended up with.
+A story about implementing fast bus scanning, event handling, and address collision resolution in Modbus.
+This article will help you discover why we needed these features, the challenges we faced, and the solutions we developed.
 
 ## Task
 
-Wiren Board peripheral devices connect to the RS-485 bus and operate using the Modbus RTU protocol - this is an old industrial data transfer protocol, which is supported in almost all controllers or top-level software.
+Wiren Board peripheral devices are connected to the RS-485 bus and operate using the Modbus RTU protocol, a legacy industrial communication standard that remains widely supported across controllers and top-level software systems.
 
 ![Controller and some peripheral devices Wiren Board](media/wb_product_line.jpg "Controller and some peripheral devices Wiren Board")
 
-Controller and some peripherals Wiren Board
+The picture above shows a controller and some peripherals made by Wiren Board
 
-But Modbus RTU has disadvantages that stem from its architecture:
+However, Modbus RTU’s architecture introduces several challenges:
 
-- the problem of address collisions - if there are two devices on the bus with the same address, then you need to physically disconnect one of them from the bus and change the address of the second to a free one;
+- **Address collisions:** when two devices share the same address, one must be physically disconnected to reassign the other to a free address.  
+- **Slow bus scanning:** The system must scan all 247 addresses across every possible connection parameter, which is time-consuming.  
+- **Inefficient register polling:** With many devices and hundreds of registers each, polling delays can stretch to several seconds, resulting in sluggish system performance.
     
-- long bus scan - you need to search through all 247 addresses on all possible connection parameters;
-    
-- a long period of polling one register in a device - if there are many devices on the bus and each has a couple of hundred registers, then depending on the speed and location of the registers, the pause between polling the same register can reach several seconds. This ultimately leads to a slow system response.
-    
+The first two issues—address collisions and slow bus scanning—only arose during commissioning and didn’t impact end users. However, the long polling period directly affected system responsiveness. To address this, integrators had to fine-tune the system by increasing polling speeds, disabling unnecessary register polling, adjusting driver priorities, and splitting the bus into multiple segments.
 
-The first two problems appeared only at the commissioning stage and did not affect the end user, but the long polling period affected the system’s response speed. Therefore, integrators had to fine-tune the system: increase the polling speed, disable polling of unnecessary registers, change polling priorities in our driver, split one bus into several.
+But what requires fast responses in dispatch systems and building automation? Primarily, user actions. For instance, when a user flips a switch, the light should turn on instantly. The maximum delay between action and response is critical here—if the system typically responds in 10 ms but occasionally takes 10 seconds, users will notice and complain.
 
-But what do you need to respond quickly to in dispatch systems and automation of engineering systems? Basically, on user actions. For example, the user pressed the switch and the light immediately turned on. The maximum time between an action and a reaction to it is very important here - if the system usually responds in 10 ms, but sometimes in 10 s, the user will notice this and start complaining.
+With these challenges clearly identified, we set out to solve them.
 
-And since there are clear problems, we can try to solve them.
+## Defining the Solution Requirements
 
-## Finding a solution
+Our initial thought was to switch the device interface and protocol, such as adopting CAN bus.
 
-The first thing that came to mind was to change the interface and protocol of the devices, for example, make devices with a CAN bus.
+However, this approach didn’t work for us:
 
-But this option did not suit us:
-
-- We are good at making devices with Modbus RTU and RS-485 - our development and production processes are tailored to this.
-    
-- Our customers often use Wiren Board devices with their controllers and Modbus RTU support is available almost everywhere.
-    
-- Devices from third-party manufacturers are often connected to our controller, and the choice of devices with RS-485 and Modbus RTU is many times wider than with the same CAN.
+- Our expertise lies in Modbus RTU and RS-485 — our development and production processes are optimized for these technologies.  
+- Many of our customers use Wiren Board devices with controllers that almost universally support Modbus RTU.  
+- Third-party devices frequently connect to our controllers, and the availability of RS-485 and Modbus RTU devices far exceeds that of CAN bus devices.
     
 
-It was probably possible to simultaneously release two lines of devices with different protocols for different market segments, but this is very expensive to develop, manufacture and support.
+We could have released two device lines with different protocols for separate market segments, but the costs for development, manufacturing, and support would have been prohibitively high.
 
 ![RS-485 transceiver in the WB-MR6C v.2 device](media/rs485_device_example.jpg "RS-485 transceiver in the device WB-MR6C v.2")
 
-RS-485 transceiver in the WB-MR6C v.2 device
+The image shows an RS-485 transceiver integrated into the WB-MR6C v.2 device.
 
-Therefore, it was important for us to preserve our main Modbus RTU protocol, which means the only solution is to develop a protocol extension using the capabilities laid down by the developers of the Modbus protocol.
+Therefore, preserving our core Modbus RTU protocol was essential. The only viable solution was to develop a protocol extension leveraging the capabilities built into Modbus by its creators.
 
-So, the requirements for the solution:
+The requirements for the solution were clear:
 
-- software, without modification of circuitry - users of recently released devices will be able to access the extension through a firmware update;
-    
-- compatible with classic Modbus RTU - our devices must remain Modbus RTU devices and be able to work on the same bus with Modbus devices from other vendors, as well as with controllers that know nothing about the expansion;
-    
-- simple - this will allow you to easily support it in third-party top-level software, which is important for partners who use our hardware and their software;
-    
-- open - we do not like closed protocols that tie users to the hardware manufacturer.
+- **Software-only:** No hardware or circuitry changes — users of recently released devices should access the extension via a firmware update.
+- **Compatibility with classic Modbus RTU:** Our devices must remain Modbus RTU-compliant and coexist on the same bus with other vendors’ Modbus devices and controllers that would be unaware of the extension.  
+- **Simplicity:** It should be easy to implement in tandem with third-party top-level software, which was crucial for partners using our hardware with their software.  
+- **Openness:** We would avoid closed protocols that lock users into a single hardware manufacturer.
     
 
-## Hardware and software for experiments
+## Hardware and Software for Experiments
 
-In the article we will analyze the protocol extension using examples and illustrate it with pictures from a logic analyzer. If you want to see with your own eyes what is happening inside, here is a list of devices and software used in the article:
+In this article, we’ll explore the protocol extension through practical examples, supported by pictures captured in logic analyzer. If you’d like to see the inner workings firsthand, here’s a list of the devices and software used:
 
-- A Linux computer with a converter [WB-USB485](https://wirenboard.com/en/product/WB-USB485/), you can take another converter or just a Wiren Board controller. And also the utility [wb-modbus-scanner](https://github.com/wirenboard/wb-modbus-ext-scanner/), which is also a reference implementation of the master for working with the extension. The compiled version for a Linux computer is at the root of the repository.
+- **Linux computer with a converter:** Use the [WB-USB485](https://wirenboard.com/en/product/WB-USB485/) or another compatible converter, such as a Wiren Board controller. Additionally, install the [wb-modbus-scanner](https://github.com/wirenboard/wb-modbus-ext-scanner/) utility, which serves as a reference implementation of the master for the protocol extension. A precompiled version for Linux is available in the repository’s root directory.
     
-- Counter input module [WB-MCM8](https://wirenboard.com/en/product/WB-MCM8/) and relay [WB-MR6C v.2](https://wirenboard.com/en/product/). It is important that the modules had the latest firmware with event support. If this is not the case, update it using the method described in the documentation.
+- **Counter input module and relay:** Use the [WB-MCM8](https://wirenboard.com/en/product/WB-MCM8/) counter input module and the [WB-MR6C v.2](https://wirenboard.com/en/product/) relay. Ensure both modules are running the latest firmware with event support. If not, update the firmware using the method described in the documentation.
     
-- Logic analyzer, for example, an open source Saleae clone.
+- **Logic analyzer:** A logic analyzer, such as an open-source Saleae clone, is required for capturing signal traces.
     
-- PulseView program for Linux or Saleae Logic for Windows. You need to enable the UART protocol decoder. Sampling settings: 10M/2MHz. Commands were issued immediately after the capture was launched - this made it possible to record the master’s request in its entirety, which was not possible with the trigger set for level decline.
-    
+- **Software for analysis:** Use PulseView (for Linux) or Saleae Logic (for Windows). Enable the UART protocol decoder and set the sampling rate to 10M/2MHz. Commands were issued immediately after starting the capture to ensure the master’s request was recorded in full, as triggering on level decline would not capture the entire request.
 
-We connected to the RS-485 transceiver input of one of the slave devices on the bus.
+We connected the logic analyzer to the RS-485 transceiver input of one of the slave devices on the bus.
 
 ![](media/stand.jpg)
-_Stand: laptop with Linux, WB-USB485 converter, logic analyzer and two Wiren Board Modbus devices with support for Fast Modbus expansion_
+_Setup: laptop with Linux, WB-USB485 converter, logic analyzer, and two Wiren Board Modbus devices with support for Fast Modbus expansion._
 
 ![More photos of the stand](media/stand2.jpg)
-_More photos of the stand_
+_More photos of the setup_
 
 ![Connecting a logic analyzer to WB-MCM8](media/stand_mcm8_la.jpg)
 _Connecting a logic analyzer to WB-MCM8_
 
 ![Screenshot of scanning process capture](media/capture_screenshot.png)
-_Screenshot of scanning process capture_
+_Scanning process looks like this_
 
 ## Classic Modbus RTU
 
-Before we deal with the extension, let's remember how the classic Modbus RTU works. For a full description of the protocol, read the official documentation.
+Before diving into the protocol extension, let’s revisit how classic Modbus RTU works. For a comprehensive description, refer to the official Modbus documentation.
 
-Modbus is a protocol that is used for data exchange between automation devices.
+Modbus is a communication protocol designed for data exchange between industrial automation devices.
 
-In Wiren Board devices, data is transmitted over RS-485 serial communication lines using the Modbus RTU protocol, which uses a half-duplex data transmission mode and operates on the “client-server” or “master-slave” principle:
+In Wiren Board devices, data is transmitted over RS-485 serial communication lines using the Modbus RTU protocol. Modbus RTU operates in half-duplex mode and follows a “client-server” or “master-slave” architecture:
 
-- The master is a client, a controller (PLC);
-    
-- A slave is a server, an input/output module, or simply a “device.”
-    
-According to the protocol specification, each slave on the bus has its own unique address from 1 to 247, address 0 is used for broadcasting commands. There are also reserved addresses from 248 to 255, which are not used in the protocol.
+- **Master:** The client, typically a controller or PLC.  
+- **Slave:** The server, often an input/output module or peripheral device.
 
-The master periodically takes turns polling the slaves, who answer him. The master does not have an address, and the protocol does not provide for the transmission of messages from the slave without a request from the master.
+According to the protocol specification:
+- Each slave on the bus has a unique address between 1 and 247.  
+- Address 0 is reserved for broadcast commands.  
+- Addresses 248 to 255 are reserved and unused in the protocol.  
 
-If an error occurs while executing a command, the slave returns its code. If the slave does not respond, the master waits for the set timeout and proceeds to polling the next device.
+The master periodically polls each slave in turn, and the slaves respond to these requests. Key characteristics of the protocol include:
+- The master does not have an address.  
+- Slaves cannot transmit messages without a request from the master.
 
+If a command execution fails, the slave returns an error code. If a slave does not respond, the master waits for a predefined timeout before moving on to the next device.
 
 
 ![Modbus RTU protocol data package](media/en/modbus_rtu_protocol_data_package.png "Modbus RTU protocol data package")
 
-_Modbus RTU protocol data packet_
+_Modbus RTU protocol data packet contents_
 
 ![Modbus transaction passed without errors](media/en/modbus_transaction_passed_without_errors.png "Modbus transaction passed without errors")
 
-_Modbus transaction completed without errors_
+_How Modbus transaction sequence when completed without errors_
 
 Data exchange in Modbus RTU occurs through registers, there are four types in total. Each type has its own read/write functions.
-Here's the markdown table based on your specifications:
 
-| **Type**               | **Size**        |  **Reading** | **Writing**       |
+
+| **Type**           	| **Size**    	|  **Reading** | **Writing**   	|
 |------------------------|-----------------|-------------|-------------------------------|
-| Coils - flag registers | 1 bit            | 0x01                      | 0x05 - one, 0x0F - many   |
-| Discrete Inputs - discrete inputs | 1 bit | 0x02                  | —                             |
-| Holding Registers - storage registers | 16-bit word | 0x03         | 0x06 - one, 0x10 - many   |
-| Input Registers - input registers | 16-bit word | 0x04            | —           |                  |
+| Coils - flag registers | 1 bit        	| 0x01                  	| 0x05 - one, 0x0F - many   |
+| Discrete Inputs - discrete inputs | 1 bit | 0x02              	| —                         	|
+| Holding Registers - storage registers | 16-bit word | 0x03     	| 0x06 - one, 0x10 - many   |
+| Input Registers - input registers | 16-bit word | 0x04        	| —       	|              	|
 
 
 **The master's request** contains the following information: address of the device on the bus; code of the function to be executed; the address of the first register, the number of registers needed and the checksum.
 
 **The slave's response** contains the following information: device address; function code; number of bytes transferred; the data itself and the checksum (CRC).
 
-#### Example of a classic Modbus request
+#### Example of a Classic Modbus Request
 
-For example, let's ask a Wiren Board device with address 20 for its modbus address, stored in holding register 128:
+Let’s request the Modbus address of a Wiren Board device (address 20), which is stored in holding register 128:
 
-0x14 — device address in HEX, 20 in DEC;
+**Request:**
+- `0x14` — Device address in HEX (20 in DEC).  
+- `0x03` — Function code: read holding register.  
+- `0x00 0x80` — Address of the first register in HEX (128 in DEC).  
+- `0x00 0x01` — Request one register.  
+- `0x87 0x27` — Checksum (CRC).
 
-0x03 - read one holding register;
-
-0x00 0x80 — address of the first register in HEX, 128 in DEC;
-
-0x00 0x01 - request one register;
-
-0x87 0x27 - checksum.
-
-Slave's response:
-
-0x14 — device address in HEX, 20 in DEC;
-
-0x03 —function that was executed;
-
-0x02 — number of bytes transferred;
-
-0x00 0x14 - data in register, 20 in DEC;
-
-0xB5 0x88 - checksum.
+**Slave’s Response:**
+- `0x14` — Device address in HEX (20 in DEC).  
+- `0x03` — Function code executed.  
+- `0x02` — Number of bytes transferred.  
+- `0x00 0x14` — Data in the register (20 in DEC).  
+- `0xB5 0x88` — Checksum (CRC).
 
 ![Example of a request for a Modbus address of a Wiren Board device and a response in classic Modbus RTU](media/en/classic_modbus_example_request.png "Example of a Modbus request- Wiren Board device addresses and response in classic Modbus RTU")
 
-_Example of a request for a Modbus address of a Wiren Board device and a response in classic Modbus RTU_
+*Example of a request for a Modbus address of a Wiren Board device and a response in classic Modbus RTU.*
 
-## Fast Modbus extension
 
-As we saw above, Modbus has a concept of functions. There are many functions, 15 of them are used, and the rest are reserved for hardware manufacturers. Therefore, manufacturers can add functionality missing from standard Modbus simply by using the capabilities inherent in the protocol.
+## Fast Modbus Extension
+
+As we’ve seen, Modbus includes a concept of functions. While 15 functions are commonly used, the rest are reserved for hardware manufacturers. This allows manufacturers to extend Modbus by adding custom functionality using the protocol’s inherent capabilities.
 
 ![Functions described in the Modbus protocol specification](media/modbus_standard_functions.png "Functions described in the Modbus protocol specification")
 
-_Functions described in the Modbus protocol specification_
+*Functions described in the Modbus protocol specification.*
 
-We took the free function **_0x46_**, with which we implemented the capabilities of our extension. To send broadcast commands we use the reserved address **_0xFD_** (253). The checksum is calculated in the same way as in a regular Modbus RTU.
+We utilized the free function **`0x46`** to implement the capabilities of our extension. For broadcast commands, we use the reserved address **`0xFD`** (253 in DEC). The checksum is calculated in the same way as in standard Modbus RTU.
 
-An important point is that if the PLC or SCADA system does not know anything about Fast Modbus, they will communicate with the new “fast” devices in the usual way, with the functions of writing/reading registers. The same is true for Wiren Board controllers - if slave devices do not support Fast Modbus, they will be polled “the old fashioned way”.
+A key advantage of this approach is backward compatibility:
+- If a PLC or SCADA system doesn’t recognize Fast Modbus, it will communicate with “fast” devices using standard read/write functions.  
+- Similarly, Wiren Board controllers will poll slave devices that don’t support Fast Modbus in the traditional way.  
 
-Fast Modbus is not a separate mode or a new protocol - it is simply an extension of the standard Modbus RTU protocol that adds new capabilities. If the functions are available, you can use them; if not, everything will work as usual.
+Fast Modbus is not a separate mode or a new protocol—it’s an extension of the standard Modbus RTU protocol. If the extended functions are available, they can be used; otherwise, the system operates as usual.
 
-On the slave side, the extension requires compliance with timings, and the master is not required to do anything other than support the commands and packet format used in the extension.
+### Implementation Details
+- **Slave Side:** Requires compliance with specific timings.  
+- **Master Side:** Only needs to support the new commands and packet format.  
 
-The "Fast Modbus" extension is open and [documented](https://github.com/wirenboard/wb-modbus-ext-scanner/blob/main/protocol.md), you can use it in your devices and software. For device developers, we offer a paid framework that implements the protocol part of the classic Modbus RTU with our extension and support for firmware updates via the RS-485 bus. But this is not necessary, you can support our expansion yourself.
+The Fast Modbus extension is open and fully [documented](https://github.com/wirenboard/wb-modbus-ext-scanner/blob/main/protocol.md). You’re free to use it in your devices and software. For device developers, we offer a **paid framework** that implements the classic Modbus RTU protocol with our extension and supports firmware updates over the RS-485 bus. However, this is optional—you can implement the extension independently.
 
-Next, we will look at why all this was done: instant search for devices on the bus, fast delivery of register changes from slave to master, and resolution of address collisions on the bus.
+Next, we’ll explore the benefits of this extension:  
+- Instant device discovery on the bus.  
+- Fast delivery of register changes from slave to master.  
+- Resolution of address collisions on the bus.
 
 ## Arbitration
 
-### Physics of the process
+### Physics of the Process
 
-Arbitration is a way for slaves to decide for themselves who will now respond to the master’s broadcast request, and also to understand whether there are others willing to respond. This usually works by allowing multiple devices to evaluate who was transmitting what while transmitting different states.
+Arbitration is a mechanism that allows slaves to determine which device will respond to the master’s broadcast request and whether there are other devices competing to respond. This is typically achieved by having multiple devices evaluate the bus state during transmission.
 
-We were inspired by the concept of arbitration in CAN and made our own version via RS-485, taking into account the characteristics of the bus. Both RS-485 and CAN use special microcircuits - transceivers (transmitters) to transmit data to the buses, but they are designed differently.
+We drew inspiration from CAN bus arbitration and adapted it for RS-485, considering the unique characteristics of the bus. While both RS-485 and CAN use transceivers (transmitters) to communicate over the bus, their designs differ significantly.
 
-**In CAN** there are two lines (CANH and CANL), which are stretched by two transistors: CANH can be pulled to power through transistor Q1, and CANL can be pressed to GND through transistor Q2.
+#### CAN Bus Arbitration
 
-When nothing happens on the bus at all, the transistors are closed and the potentials between the lines are equalized through termination resistors. Receivers detect this condition as recessive.
 
-At the moment of transmission of the dominant state, both transistors open and the CANH line is pulled to the power supply, and the CANL line is pressed to GND. Based on the potential difference between the lines, the receivers understand that the bus is in a dominant state.
+In CAN, two lines (CANH and CANL) are controlled by transistors:
+- **Recessive State:** Both transistors are closed, and the lines are equalized through termination resistors.  
+- **Dominant State:** Both transistors open, pulling CANH to power and CANL to GND. Receivers detect this state based on the potential difference.
 
 ![Transmission of different states by two transmitters in CAN. Resistors are line resistance](media/en/can_phy_level.png "Transmission of different states by two transmitters in CAN. Resistors are line resistance")
 
-_Transmission of different states by two transmitters in CAN. Resistors are line resistance_
+*Transmission of different states by two transmitters in CAN. Resistors are line resistance.*
 
-As you can see from the figure above, if you connect two CAN transmitters together and transmit different states at the same time, the dominant state will be established on the bus. And the one who transmits the recessive will know about it. It turns out that we can simultaneously set different states on the bus using different transmitters.
+If two CAN transmitters transmit different states simultaneously, the dominant state prevails. The transmitter sending the recessive state detects this and stops transmitting. Arbitration in CAN occurs bit by bit, with the dominant state winning.
 
-The arbitration itself in CAN works like this: devices transmit their identifier bit by bit to the bus, setting either a recessive or a dominant state on the bus. The device that puts the dominant state into the bus wins the arbitration, and the recessive one loses. The atomic unit of arbitration here is the bit.
+#### RS-485 Arbitration
 
-**RS-485** also has two lines (A and B), but the transmitter has a separate pair of transistors to pull lines A and B to power (Q1 and Q2) and a separate pair to push to GND (Q3 and Q4) - this is necessary in order to be able to explicitly transmit logical zero and one to the line, which increases noise immunity.
 
-When nothing happens on the bus at all, that is, the transmitter is turned off and all four transistors inside it are closed, the lines are stretched with failsafe bias resistors. Receivers detect this state as a logical one.
+RS-485 also uses two lines (A and B), but its transceivers have four transistors:
+- **Logical One:** Q1 pulls B to power, and Q4 presses A to GND.  
+- **Logical Zero:** Q2 pulls A to power, and Q3 presses B to GND.  
 
-At the moment of transmission, the transmitter is turned on and the transistors pull one of the lines to the power supply, and the other is pressed to GND - the states of the transistors depend on what we are transmitting:
-
-- logical one - Q1 pulls B to power, and Q4 presses A to GND;
-    
-- logic zero - Q2 pulls A to power, and Q3 pushes B to GND.
-    
-
-If you follow andworking on the CAN bus, a natural way to listen to the echo during transmission suggests itself in the hope that one of the states on the RS-485 line will be dominant - but this will not happen.
+When no transmission occurs, the lines are pulled to a logical one by failsafe bias resistors.
 
 ![Simultaneous transmission of logical 0 and 1 by RS-485 transmitters. The receivers are not indicated in the diagram](media/en/modbus_phy_level.png "Simultaneous transmission of logical 0 and 1 by RS-485 transmitters. The receivers in the diagram are not indicated")
 
-_Simultaneous transmission of logical 0 and 1 by RS-485 transmitters. Receivers are not indicated on the diagram_
+*Simultaneous transmission of logical 0 and 1 by RS-485 transmitters. Receivers are not indicated on the diagram.*
 
-In the picture above, two transmitters are connected to a common RS-485 bus and transmit different states simultaneously:
+If two RS-485 transmitters transmit different states simultaneously, current flows between them. On short lines, the stronger transmitter dominates; on long lines, the potential distributes unevenly. This makes it impossible to use logical 0 and 1 as dominant and recessive states.
 
-- in the first transmitter, transistors Q1a and Q4a are open - a logical unit is transmitted to the bus;
-    
-- in the second transmitter, transistors Q2b and Q3b are open - a logical zero is transmitted to the bus.
-    
+#### Our Solution
 
-As we see, current flows from one transmitter to another. Therefore, on a short line, the state will be determined by a stronger transmitter (or how lucky), and on a long line, the potential will be distributed along the bus, and the receivers of each device will hear the states that their transmitters transmit.
 
-This means that we cannot use states 0 and 1 as dominant and recessive when the transmitters are turned on. Therefore, we had no other choice but to accept silence as a recessive state, and the transmission of one of the states as dominant.
-
-In the process of research, we encountered another problem that prevented us from copying the CAN arbitration principle with one-bit atomicity - Linux in the master. Although he does not participate in arbitration, after the request he waits for a response from the slaves. And if the received parcels do not have the USART frame format, then the receiver in Linux will detect ERROR FRAME, and this will complicate working with the bus.
-
-Therefore, we made the transfer of one byte as a dominant state - this allowed us to easily process these states in the master with Linux and relieved the slaves of the need to listen to what others were transmitting to the bus.
+We adopted **silence** as the recessive state and **transmission of a specific state** as the dominant state. However, we faced a challenge: Linux on the master side detects errors if received packets don’t conform to the USART frame format. To address this, we made the dominant state the transmission of one byte (`0xFF`), which simplifies processing on Linux and eliminates the need for slaves to monitor the bus during arbitration.
 
 ![Oscillogram of arbitration on the RS-485 bus](media/en/rs485_arbitration_scope.png "Oscillogram of arbitration on the RS-485 bus")
 
-_Waveform of arbitration on the RS-485 bus_
+*Waveform of arbitration on the RS-485 bus.*
 
-**Dominant state** is transmitted with the value _0xFF_ using normal USART transmission and hardware control of the bus driver. _0xFF_ is the maximum number that can be transmitted in one byte and is transmitted as a 1-bit wide pulse during the transmission of the start bit. The rest of the time the package is transmitted with state 1 (IDLE) on the bus. This turned out to be convenient, since if any desynchronization of the slave transmitters occurs, it will be small.
-
-**Recessive state** is silence during the arbitration window, that is, the transmitter is turned off. By doing this, we bypass the hardware limitation of the RS-485 bus, in which it is impossible to simultaneously transmit different states.
-
-**Arbitration window** is the time interval required to receive 12 bits (one UART frame with two stop bits and a parity bit) plus the time reserve for processing the interrupt in the slave microcontroller. The time reserve for interruption is limited below 50 μs and is a multiple of the transmission time of 1 bit.
+- **Dominant State:** Transmitted as `0xFF` using standard USART transmission. This ensures minimal desynchronization even if slave transmitters are slightly misaligned.  
+- **Recessive State:** Silence during the arbitration window.  
+- **Arbitration Window:** A time interval for transmitting 12 bits (one UART frame with two stop bits and a parity bit) plus a 50 μs buffer for interrupt processing.
 
 ![Recessive and dominant states of the bus at the time of arbitration](media/en/rs485_arbitration_logic_analyzer.png "Recessive and dominant states of the bus at the time of arbitration")
 
-_Logic analyzer picture of recessive and dominant states on the bus at the time of arbitration_
+*Logic analyzer picture of recessive and dominant states on the bus at the time of arbitration.*
 
-One identifier bit is transmitted per arbitration window: 0 is a dominant state, and 1 is a recessive state.
+Each arbitration window transmits one identifier bit:
+- **0 (Dominant):** The device sends `0xFF` at the start of the window. If another transmission is detected (via the BUS BUSY flag), the device remains silent.  
+- **1 (Recessive):** The device remains silent and listens. If a byte is received, another device has transmitted a dominant state, and arbitration is lost.
 
-If the device must transmit a dominant state, then at the beginning of the arbitration window it sends _0xFF_ to the bus. If a transmission is already in progress on the bus, the device is silent so as not to transmit a message that is out of sync. Such a device cannot lose in this arbitration window. An alien transmission is detected using the BUS BUSY flag, which is in the USART hardware block and is set if an alien start bit is detected on the bus.
+### Arbitration Flow
 
-If the device must transmit a recessive state, it is silent during the entire arbitration window and listens to the bus. If a byte was received from the bus during the arbitration window, another device transmitted a dominant state and arbitration was lost.
+During arbitration, the slave device transmits an **arbitration word** bit by bit. This word consists of a **priority** and a **unique identifier**.
 
-### Arbitration flow
+- **Message Priority:** 4 bits, where `0` (`0b0000`) is the highest priority and `15` (`0b1111`) is the lowest.  
+- **Unique Identifier:** Depends on the command sent by the master:  
+  - **Scan:** A 28-bit number derived from the lower 28 bits of the device’s unique serial number. This allows us to ignore Modbus address collisions and ensures compatibility with devices from other manufacturers. For DIY projects, a separate range of serial numbers is allocated, as documented on GitHub.  
+  - **Event Polling:** An 8-bit Modbus address. Since devices are already configured and address collisions are resolved, there’s no need to use serial numbers for arbitration.  
 
-During arbitration, the slave device transmits one bit at a time **arbitration word**, which consists of a priority and a unique identifier.
+The arbitration word is **12 bits long** (4 + 8) for events or **32 bits long** (4 + 28) for scanning. Bits are transmitted starting with the **MSB** (Most Significant Bit) and ending with the **LSB** (Least Significant Bit).
 
-**Message priority** is 4 bits: 0 (_0b0000_) is the highest, 15 (_0b1111_) is the lowest.
+Each bit of the arbitration word is transmitted during a single arbitration window. By the end of the arbitration process, only one device remains—the winner.
 
-**Unique identifier** depends on the command sent by the master:
+- **0 (Dominant State):** Transmitted by sending `0xFF`.  
+- **1 (Recessive State):** Transmitted by remaining silent.  
 
-- Scan - (28-bit number) the lower 28 bits of the unique serial number, which allows us to ignore modbus address collisions. So that devices with expansion support from different manufacturers can work on the same bus, we distribute serial butmeasures, and for DIY they allocated a separate range - it is indicated in the documentation on Github.
-    
-- Event polling—modbus address (8-bit number). Devices on the bus are already configured, there are no address collisions, there is no point in wasting time arbitrating by serial numbers.
-    
+This means arbitration is always won by the device with the **lowest arbitration word value**. Higher-priority messages (lower priority bits) win first. If priorities are equal, the device with the **lowest unique identifier** wins.
 
-As a result, the arbitration word has a length of 12 bits (4+8) for events or 32 bits (4+28) for scanning.
+#### Why Only 28 Bits of the Serial Number Are Used for Scanning
 
-The identifier bits are transmitted in order, starting with MSB (most significant bit, the most significant bit in a word) and ending with LSB (least significant bit, the least significant bit in a word).
+The serial number of our devices is a 32-bit number. However, we only use the **lower 28 bits** for scanning. The **most significant 4 bits** are discarded to fit the arbitration word into 32 bits (28 + 4). Since these 4 bits are always `1` in our serial numbers, discarding them doesn’t affect uniqueness.
 
-The arbitration word bits are transmitted one at a time during the arbitration window. By the time the transmission of the arbitration word is completed, only one device remains - the winner of the arbitration.
+![When scanning, the lower 28 bits of the device serial number are used. The highest four are discarded. We specially issue serial numbers so that this does not affect the uniqueness](media/en/28bits.png "When scanning, the lower 28 bits of the device serial number are used. The highest four are discarded. We specially issue serial numbers so that this does not affect the uniqueness")
 
-**Zero is transmitted by the dominant state, and one by the recessive** - this means that arbitration is always won by devices with a lower value of the arbitration word. Since 4 priority bits come first, higher priority messages win. If the priority is the same, then the device with the lowest ID wins the arbitration.
+*When scanning, the lower 28 bits of the device serial number are used. The highest four are discarded. We specially issue serial numbers to ensure uniqueness.*
 
-#### Why is only 28 bits of the serial number used for scanning?
-If you now take the serial number of any of our devices and convert it to the binary number system, you will get a 32-bit number. But as we have already said, we only use the lower 28 bits of the serial, so where do the higher ones go?
+![An example of how arbitration occurs when scanning a bus](media/en/rs485_arbitration_example_scan.png "An example of how arbitration occurs when scanning a bus")
 
-We simply discard the most significant four bits of the serial number so that, together with the priority bits, they fit into a 32-bit arbitration word: 28 + 4 = 32. We always have ones in the highest four bits of the serial number, so we do not lose anything from this approach.
-
-![When scanning, the lower 28 bits of the device serial number are used. The highest four are discarded. We specially issue serial numbers so that this does not affect the uniqueness](media/en/28bits.png "When scanning, the lower 28 bits of the device serial number are used. The highest four are discarded. We specially issue serial numbers so that this does not affect the uniqueness ")
-
-_When scanning, the lower 28 bits of the serial number are used device numbers. The highest four are discarded. We specially issue serial numbers so that this does not affect uniqueness._
-
-
-![An example of how arbitration occurs when scanning a bus](media/en/rs485_arbitration_example_scan.png "An example of how arbitration occurs when scanning a bus ")
-
-_An example of how arbitration occurs when scanning a bus_
+*An example of how arbitration occurs when scanning a bus.*
 
 ### Timings
 
-To understand the nature of the selected timings, let’s remember what a UART package looks like.
+To understand the timings, let’s revisit the structure of a UART frame. Each bit, including start and stop bits, has a duration of `1 / baudrate`. We use a hardware timer synchronized with the UART bit rate to define arbitration windows, ensuring all intervals are multiples of the bit transmission time.
 
-Each data bit, as well as the start and stop bits, have the same duration, which is 1 s/baudrate. To form arbitration windows, we use a separate hardware timer, which is configured so that it increments at the same rate as one bit is transmitted over the UART. Therefore, all our time intervals are multiples of the transmission time of one bit.
+#### Key Timing Parameters
+- **Wait for Arbitration Start:** The time between the master’s request and the first arbitration window.  
+  - **Upper Limit:** The transmission time of 3.5 characters (Modbus standard), allowing the master to switch from transmitter to receiver mode.  
+  - **Lower Limit:** 800 µs, experimentally determined with a safety margin, ensuring devices have time to process the request and decide whether to participate in arbitration.  
 
-**Wait for arbitration to start** is the time between the master request and the first arbitration window. From above, it is limited by the transmission time of 3.5 characters according to the Modbus standard - this is necessary in order to have time on the master to turn off the transmitter and turn on the receiver to receive responses from devices on the bus. The lower limit is 800 μs and is a multiple of the transmission time of a whole bit. The lower limit was selected experimentally with a reasonable margin and is needed so that devices have time to process the request and understand whether they need to participate in arbitration and with what priority.
+- **Arbitration Window Duration:** The time required to transmit one 12-bit UART frame (8 data bits, 1 parity bit, 2 stop bits, and 1 start bit) plus 50 µs for processing. This is rounded up to a whole bit duration.  
 
-**The duration of the arbitration** window is equal to the time required to transmit one 12-bit frame (8 data bits, 1 parity bit, 2 stop bits and 1 start bit) plus 50 µs, rounded up to the time of transmission of the whole bit - this is the time , devices need to process the dominant state on the bus and decide whether they continue to arbitrate.
-
-**Timeout for receiving response** is the time that the master waits to understand that there are no devices on the bus that support the Fast Modbus expansion, and to start polling with classic polling. It is calculated as follows: _waiting for the start of arbitration + duration of the arbitration window * number of bits in arbitration._
+- **Timeout for Receiving Response:** The time the master waits to determine if no devices support Fast Modbus, after which it falls back to classic polling.  
+  - **Calculation:** `Wait for arbitration start + (Arbitration window duration * Number of bits in arbitration)`.
 
 ![Formation of a timeout for receiving a response](media/en/rs485_arbitration_timeout.png "Formation of a timeout for receiving a response")
 
-_Creating a timeout for receiving a response_
+*Creating a timeout for receiving a response.*
 
-#### Timeout calculation example
-For example, let's calculate the timeout for waiting for a response at a speed of 115200 bps:
+#### Example: Timeout Calculation at 115200 bps
+- **Bit Duration:** `(1s / 115200 bps) * 1000000 = 8.681 µs`  
+- **Wait for Arbitration Start:**  
+  - `3.5 * (1 start + 8 data + 1 parity + 2 stop) = 42 bits * 8.681 µs = 364.602 µs`  
+  - Since this is less than 800 µs, we round up: `ROUNDUP(800 / 8.681) = 93 bits` → `93 * 8.681 = 807.333 µs`  
+- **Arbitration Window Duration:**  
+  - `(12 bits * 8.681 µs) + ROUNDUP(50 µs / 8.681 µs) * 8.681 µs = 104.172 + 68.681 = 156.258 µs`  
+- **Timeout for Response:**  
+  - **Scan (32 bits):** `807.333 µs + 156.258 µs * 32 = 5800.256 µs ≈ 5.8 ms`  
+  - **Events (12 bits):** `807.333 µs + 156.258 µs * 12 = 2675.096 µs ≈ 2.7 ms`
 
-Transmission time of 1 bit at a given speed = (1s/115200 bps) * 1000000 = 8.681 µs
-
-* _Waiting for the start of arbitration_ = 3.5 * ( 1 start + 8 data + 1 parity + 2 stop ) = 42 bits * 8.681 µs = 364.602 µs This turned out to be less than the required 800 µs, but you need to wait at least 800 µs, so the timer is set to ROUNDUP(800 / 8.681) = 93 bits. The time will be 93 * 8.681 = 807.333 µs
-
-* _Arbitration window duration_ = (12 bits * 8.681 µs) + ROUNDUP(50 µs / 8.681 µs) * 8.681 µs = 104.172 + 68.681 = 156.258 µs
-
-The number of bits in arbitration during scanning is 32, and in events 12. We get a timeout for receiving a response, which the master is waiting for:
-
-* Scan: 807.333 µs + 156.258 µs * 32 = 5800.256 µs ≈ 5.8 ms
-
-* Events: 807.333 µs + 156.258 µs * 12 = 2675.096 µs ≈ 2.7 ms
 ## Scan
 
 ### Principle
 
-Classic bus scanning in Modbus is a sequential search of all addresses with all connection settings, which takes more than 15 minutes: 247 addresses, 8 speeds, 3 parity options and 2 stop bit options. And if there are devices on the bus with the same addresses, then it becomes impossible to distinguish one from the other.
+Classic Modbus bus scanning involves sequentially checking all addresses and connection settings, which can take over 15 minutes: 247 addresses, 8 baud rates, 3 parity options, and 2 stop bit configurations. If devices share the same address, distinguishing between them becomes impossible.
 
-Using Fast Modbus, iterating over all possible combinations of speed, parity and stop bits on one bus occurs in just ~3.5 seconds. We don’t have to go through all 247 addresses on the bus and wait for a timeout for each request - this saves time.
+With Fast Modbus, scanning all combinations of speed, parity, and stop bits on a single bus takes just ~3.5 seconds. We avoid iterating through all 247 addresses and waiting for timeouts, significantly saving time.
 
-In general, in our devices it happens like this:
+Here’s how it works in our devices:
 
-1. The master sends a “Start scanning” broadcast command to the bus.
-    
-2. Slaves conduct arbitration among themselves - the winner transfers data about himself: serial number and modbus address.
-    
-3. The master accesses the slave by serial number and reads the model from it.
-    
-4. After proofreading the model, the master sends the “Continue scanning” command to the bus.
-    
-5. The slaves conduct arbitration again, the winner of the arbitration sends data about himself, and the master reads the command from him.
-    
-6. The master again sends the “Continue scanning” command to the bus. And this continues until there are no unscanned devices left on the bus. When this happens, the device with the lowest identifier will receive the “End of scan” message.
-    
+1. The master sends a **“Start scanning”** broadcast command to the bus.
+2. Slaves conduct arbitration—the winner transmits its serial number and Modbus address.
+3. The master accesses the winning slave by serial number and reads its model.
+4. The master sends a **“Continue scanning”** command.
+5. Slaves conduct arbitration again, and the winner sends its data. The master reads the model.
+6. This cycle repeats until no unscanned devices remain. When no devices respond, the master receives an **“End of scan”** message.
 
 ![](media/en/rs485_scan_cont.png)
 
-_In fact, the process looks like this: requests “Who is there?”, arbitration, answers from the winners “I’m here!” and the final “There is no one else”_
+*In practice, the process involves: “Who is there?” requests, arbitration, responses from winners (“I’m here!”), and the final “No one else.”*
 
-If no one responded to the “Start scanning” command, the wizard waits a timeout and switches the communication settings. The timeout is small, there is no need to go through all the addresses, so searching through the settings is very fast.
+If no devices respond to the **“Start scanning”** command, the master waits for a short timeout and switches communication settings. Since the timeout is minimal and addresses aren’t iterated, scanning through settings is extremely fast.
 
-The following functions are available for scanning:
+#### Functions for Scanning
+- **0x01:** Start scanning (sent by the master).  
+- **0x03:** Scan response (sent by a slave).  
+- **0x02:** Continue scanning (sent by the master).  
+- **0x04:** End of scan (sent by a slave).  
 
-- 0x01 — start scanning, sends the master;
-    
-- 0x03 — response to scanning, sent by one of the slaves;
-    
-- 0x02 — continue scanning, sends the master;
-    
-- 0x04 - end of scanning, sends one of the slaves.
-    
-
-#### Block diagram
-
+#### Block Diagram
 ![](media/en/scan_block_diagram.png)
 
-Let's take two devices and connect them to the bus; ours have serial numbers:
+### Example: Scanning Two Devices
 
-1. WB-MCM8 - 4265607340 (dec) = 0xFE4000AC
-    
-2. WB-MR6C v.2 - 4275217318 (dec) = 0xFED2A3A6
-    
+Let’s connect two devices to the bus:
+1. **WB-MCM8:** Serial number `4265607340` (`0xFE4000AC`).  
+2. **WB-MR6C v.2:** Serial number `4275217318` (`0xFED2A3A6`).  
 
-Let's scan the bus using the wb-modbus-scanner utility:
+We’ll scan the bus using the `wb-modbus-scanner` utility:
 
-```
+```bash
 # wb-modbus-scanner -d /dev/ttyRS485-1 -D -b 115200
 Serial port: /dev/ttyRS485-1
 Use baud 115200
@@ -391,45 +348,40 @@ End SCAN
 
 ```
 
-When executing the command, we enabled debugging with the -D parameter so that we could see the bytes being sent and received, which we will discuss below.
+While executing the command, we enabled debugging with the -D parameter to see the bytes being sent and received. The process will be shown below.
 
-### Start scanning
+### Start Scanning
 
-The master sends the command “Start scanning” to the bus, which actually sounds: “Who is there?” Having accepted this command, all slave devices on the bus consider themselves unscanned.
+The master sends the **“Start scanning”** command to the bus, effectively asking, “Who is there?” Upon receiving this command, all slave devices on the bus mark themselves as unscanned.
 
-Unscanned devices will try to send a response with the same priority (0b0110), so the device with the lowest serial number will win the arbitration this time.
+Unscanned devices respond with the same priority (`0b0110`), so the device with the **lowest serial number** wins the arbitration.
 
-#### "Start Scan" command
+#### “Start Scan” Command
 
 ```
 FD 46 01 13 90
 ```
 
-- 0xFD — broadcast address;
-    
-- 0x46 — command for working with extended functions;
-    
-- 0x01 — subcommand to start scanning;
-    
-- 0x13 0x90 — checksum.
+- **0xFD:** Broadcast address.  
+- **0x46:** Command for extended functions.  
+- **0x01:** Subcommand to start scanning.  
+- **0x13 0x90:** Checksum.
 
 ![Start scanning and arbitration](media/en/start_scan_cmd.png "Start scanning and arbitration")
 
-Start scanning and arbitration
+*Start scanning and arbitration.*
 
-### Response from the arbitration winner
+### Response from the Arbitration Winner
 
-The slaves conduct arbitration among themselves, which wins the unscanned device with a lower serial number.
-
-It is important here that the device indicates its serial number in the response, that is, in the event of a collision of modbus addresses on the bus, we can see this and change the modbus address by contactingdevice by serial number.
+The slaves conduct arbitration, and the unscanned device with the **lowest serial number** wins. The winning device responds with its serial number and Modbus address, allowing the master to detect and resolve address collisions by addressing devices via their serial numbers.
 
 ![The priority of both devices is the same (0110), so the second loses by serial number](media/en/arbitration_loss.png "The priority of both devices is the same (0110), so the second one loses by serial number")
 
-The priority of both devices is the same (0110), so the second loses by serial number
+*The priority of both devices is the same (`0b0110`), so the second loses by serial number.*
 
-![Request, arbitration and winner's response](media/en/arbitration_win.png "Request, arbitration and winner's response")
+![Request, arbitration, and winner's response](media/en/arbitration_win.png "Request, arbitration, and winner's response")
 
-_Request, arbitration and winner's response_
+*Request, arbitration, and winner's response.*
 
 
 #### Device response with information about itself
@@ -437,16 +389,12 @@ _Request, arbitration and winner's response_
 FD 46 03 FE 40 00 AC 14 E8 3A
 ```
 
+
 - 0xFD — broadcast address;
-    
 - 0x46 — command for working with extended functions;
-    
 - 0x03 — scan response subcommand;
-    
 - 0xFE 0x40 0x00 0xAC — device serial number (big endian);
-    
 - 0x14 — modbus address of the device;
-    
 - 0xE8 0x3A — checksum.
 
 ### Read registers by serial number
@@ -455,24 +403,19 @@ After the master receives a response from the slave who won the arbitration, we 
 
 Here we access the device by serial number, use the standard “read register” command, but package the request in a special package with the function of emulating the standard _0x08_ command.
 
+
 ```
 FD 46 08 FE 40 00 AC 03 00 C8 00 14 91 BA
 ```
 
-- 0xFD — broadcast address;
-    
-- 0x46 — command for working with extended functions;
-    
-- 0x08 — subcommand for emulating standard requests;
-    
-- 0xFE 0x40 0x00 0xAC — serial number of the device we are accessing (big endian);
-    
-- 0x03 — normal request: standard function code for working with registers;
-    
-- 0x00 0xC8 0x00 0x14 — request body: read 20 registers (0x14) starting from 200 (0xC8);
-    
-- 0x91 0xBA - checksum.
 
+- 0xFD — broadcast address;
+- 0x46 — command for working with extended functions;
+- 0x08 — subcommand for emulating standard requests;
+- 0xFE 0x40 0x00 0xAC — serial number of the device we are accessing (big endian);
+- 0x03 — normal request: standard function code for working with registers;
+- 0x00 0xC8 0x00 0x14 — request body: read 20 registers (0x14) starting from 200 (0xC8);
+- 0x91 0xBA - checksum.
 
 ![Request for registers with a device model and response](media/en/request_by_sn.png "Request for registers with a device model and response")
 _Request for registers with device model and response_
@@ -480,26 +423,22 @@ _Request for registers with device model and response_
 The device that has received the request addressed to it responds with a packet with the _0x09_ function and encloses a standard response to the Modbus command in the body.
 
 Response to a register read request
+
+
 ```
 FD 46 09 FE D2 A3 A6 03 28 00 57 00 42 00 4D 00 52 00 36 00 43 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 CE 86
 ```
 
+
 - 0xFD — broadcast address;
-    
 - 0x46 — command for working with extended functions;
-    
 - 0x09 — subcommand for emulating a response to a standard request;
-    
 - 0xFE 0x40 0x00 0xAC — serial number of the device we are accessing (big endian);
-    
 - 0x03 — normal answer: standard function code for working with registers;
-    
-- 0x28 0x00 0x57 0x00 0x42 0x00 0x4D 0x00 0x43 0x00 0x4D 0x00 0x38 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x 00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 — response body;
-    
-- 0xCE 0x86 - checksum
+- 0x28 0x00 0x57 0x00 0x42 0x00 0x4D 0x00 0x43 0x00 0x4D 0x00 0x38 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 — response body;
+- 0xCE 0x86 - checksum.
 
 ![The entire master request and the slave’s response](media/en/request_by_sn_full.png "The entire master request and the slave’s response")
-
 _Entire master request and slave response_
 
 ### Continue scanning
@@ -512,25 +451,21 @@ So, the master received a response from the device that won the arbitration and 
 FD 46 02 53 91
 ```
 
--   0xFD — широковещательный адрес;
-    
--   0x46 — команда работы с расширенными функциями;
-    
--   0x02 — субкоманда продолжения сканирования;
-    
--   0x53 0x91 — контрольная сумма.
+
+- 0xFD — broadcast address;
+- 0x46 — command for working with extended functions;
+- 0x02 — subcommand to continue scanning;
+- 0x53 0x91 — checksum.
 
 The devices again play arbitration, which wins the unscanned device with the lowest serial number. The winner of the arbitration replies “I’m here,” and the master reads the model from him.
 
 ![The device with high priority won the arbitration](media/en/arbitration_2nd_round.png "The device with high priority won the arbitration")
-
 _The arbitration was won by the device with higher priority_
 
 This cycle of "Continue Scan" → "Arbitration" → "Device Response" → "Model Request" → "Device Response" is repeated until all devices on the bus have been scanned.
 
-![Continuation of scanning, arbitration and response of another unscanned device](media/en/arbitration_continues.png "Continuation of scanning, arbitration and response of another unscanned device ")
-
-Continuation of scanning, arbitration and response of another unscanned device
+![Continuation of scanning, arbitration and response of another unscanned device](media/en/arbitration_continues.png "Continuation of scanning, arbitration and response of another unscanned device")
+_Continuation of scanning, arbitration and response of another unscanned device_
 
 ### End scan
 
@@ -541,8 +476,7 @@ But as soon as all devices on the bus are scanned, the arbitration will win a me
 This arbitration will win the device with the lowest serial number (based on the remaining bits of the arbitration word). But it doesn't matter which device won this arbitration: all scanned devices tried to send the same "End Scan" message. Having received such a response, the master can be sure that there is not a single unscanned device left on the bus. This approach prevents the master from waiting for a timeout.
 
 ![Only scanned devices remained, so messages from one of them won arbitration. The second device lost by serial number](media/en/arbitration_3rd_round.png "Only scanned devices remained, so messages from one of them won arbitration. The second device was lost by serial number")
-
-Only scanned devices remained, so messages from one of them won arbitration. The second device was lost by serial number
+_Only scanned devices remained, so messages from one of them won arbitration. The second device was lost by serial number_
 
 "End of scan" message
 
@@ -550,13 +484,10 @@ Only scanned devices remained, so messages from one of them won arbitration. The
 <- FD 46 04 D3 93
 ```
 
--   0xFD — широковещательный адрес;
-    
--   0x46 — команда работы с расширенными функциями;
-    
--   0x04 — субкоманда завершения сканирования;
-    
--   0xD3 0x93 — контрольная сумма.
+- 0xFD — broadcast address;
+- 0x46 — command for working with extended functions;
+- 0x04 — subcommand to end scanning;
+- 0xD3 0x93 — checksum.
 
 ![Continuation of scanning, arbitration and the winner's answer - “There is no one else”](media/en/arbitration_3rd_cont.png "Continuation of scanning, arbitration and The winner's answer is 'There is no one else.'")
 _Continuation of scanning, arbitration and the winner's answer - “There is no one else”_
@@ -565,75 +496,60 @@ _Continuation of scanning, arbitration and the winner's answer - “There is no 
 
 ### Overview
 
-The Fast Modbus extension allows you to quickly poll events that occur in devices without polling each of them in turn. Here, unlike scanning, we work using modbus addresses of devices, so there should be no address collisions on the bus, just like when working with classic Modbus.
+The Fast Modbus extension enables quick polling of events from devices without sequentially querying each one. Unlike scanning, this process uses Modbus addresses, so address collisions must be avoided, just as in classic Modbus.
 
-In general, it happens like this:
+Here’s how it works:
 
-1. The master sends a broadcast command “Does anyone have what?” to the bus.
-    
-2. Slaves conduct arbitration among themselves based on priority and address - the winner transfers a package with the events he has.
-    
-3. The master receives a packet with events and sends a packet with the command “Does anyone have what?” to the bus.
-    
-4. If no one has any events left, the device with the lowest modbus address wins the arbitration and informs the master that there are no more events on the bus.
-    
-5. The master again sends the command “Does anyone have what?” to the bus. and everything repeats again: arbitration, device response with events.
-    
+1. The master sends a broadcast command: **“Does anyone have events?”**  
+2. Slaves conduct arbitration based on priority and address—the winner transmits its events.  
+3. The master receives the event packet and sends another **“Does anyone have events?”** command.  
+4. If no events remain, the device with the lowest Modbus address wins arbitration and informs the master that no more events are available.  
+5. The cycle repeats: arbitration, event response, and acknowledgment.
 
 ![Event request block diagram](media/en/events_block_diagram.png "Event request block diagram")
 
-_Block diagram_
+*Block diagram of event polling.*
 
-The following functions are provided for working with events:
+#### Functions for Event Handling
+- **0x10:** Master requests events from slaves.  
+- **0x11:** Slave transmits events to the master.  
+- **0x12:** Slave responds if no events are available.  
+- **0x18:** Master configures events in the slave.  
 
-- 0x10 — the master requests events from slaves;
-    
-- 0x11 — transmission of events from slave to master;
-    
-- 0x12 — slave response if there are no events on the bus;
-    
-- 0x18 — setting up events by the master in the slave.
-    
+#### Event Types
+There are 4 types of events, corresponding to register types, and a fifth system event:
+- **1:** Coil.  
+- **2:** Discrete.  
+- **3:** Holding.  
+- **4:** Input.  
+- **15:** System event.  
 
-There are 4 types of events, similar to register types and a fifth system one:
+By default, all events in Wiren Board devices are disabled except the low-priority **“I rebooted”** event. Events are enabled by adjusting their priorities, which affect the 4-bit message priority during arbitration:
+- **0:** Event is inactive.  
+- **1:** Low-priority event.  
+- **2:** High-priority event.  
 
-- 1 — coil;
-    
-- 2 — discrete;
-    
-- 3 — holding;
-    
-- 4 — input;
-    
-- 15 — system event.
-    
+**Priorities are set per event:** If a device has a high-priority event, it enters arbitration with a lower priority bit value, increasing its chances of winning. If multiple devices have high-priority events, they win arbitration in order of their Modbus addresses (lowest first). For more details, see the **Arbitration** section.
 
-By default, in Wiren Board devices, all events except the low priority event “I rebooted” are disabled. Enabling occurs by changing priorities, which affect those 4 message priority bits at the time of arbitration:
-
-- 0 — event is not active;
-    
-- 1 — low priority event;
-    
-- 2—high priority event.
-    
-
-**Priorities are set for each event**: if a device experiences a priority event, it will enter arbitration with a lower priority bit value and win arbitration first. If there are several such devices, they will win arbitration one by one, starting with the smallest modbus address. Read more about the arbitration procedure in the “Arbitration” section.
-
-The master also has the ability to request events from devices starting from a specific modbus address. This is a protection tool against cases when some device with a small address spams events onto the bus, preventing other devices from winning arbitration.
+The master can also request events starting from a specific Modbus address. This prevents devices with low addresses from monopolizing the bus with frequent events.
 
 ![Process of requesting events and responses](media/en/events_logic_analyzer.png "Process of requesting events and responses")
-_Event Request and Response Process_
 
-**To ensure delivery of events** from the device to the master, event acknowledgment is provided. The event packet contains a flag field, which can be 0 or 1. The slaves in each event packet invert this flag relative to the previous one sent by them. Thus, there are no two consecutive packets from the same device with the same flag value. Flags from different devices are not related to each other.
+*Event request and response process.*
 
-When the master has received a packet with events, it sends another broadcast event request to the bus and puts in a special place the modbus address of the device that needs to confirm the event and the flag from the received packet with the events that it confirms. If there is nothing to confirm, the master simply indicates 0 in the event request packet in the field for the device’s modbus address.
+### Event Acknowledgment
 
-The slave, who saw its modbus address and the correct flag in the event request, resets the sent events and goes to arbitration with new ones. If the flag arrived incorrectly, it adds new events to those already sent, goes to arbitration and, after winning, sends a new packet with the same flag.
+To ensure reliable event delivery, the Fast Modbus extension includes an acknowledgment mechanism. Each event packet contains a **flag field** (0 or 1). Slaves invert this flag in each subsequent packet they send, ensuring no two consecutive packets from the same device have the same flag. Flags are independent between devices.
 
-When polling events, the master is guided by a standard wait time formula, in which 12 arbitration windows are expected: the transmission of 4 priority bits and 8 modbus address bits.
+When the master receives an event packet, it sends another broadcast event request, including the Modbus address of the device to acknowledge and the flag from the received packet. If no acknowledgment is needed, the master sets the device address field to 0.
+
+The slave, upon seeing its address and the correct flag in the event request, clears the sent events and prepares new ones for arbitration. If the flag is incorrect, the slave adds new events to the existing ones and retransmits them with the same flag.
+
+During event polling, the master uses a standard wait time formula, expecting 12 arbitration windows: 4 for priority bits and 8 for Modbus address bits.
 
 ![Event confirmation and flag alternation](media/en/event_confirmation.png "Event confirmation and flag alternation")
-_Event acknowledgment and flag rotation_
+
+*Event acknowledgment and flag alternation.*
 
 ### Setting up events on the device
 
@@ -643,61 +559,50 @@ Let's enable sending of the event for changing the short press counter of the ei
 # wb-modbus-scanner -d /dev/ttyRS485-1 -D -i 20 -r471 -t 4 -c 1 -b 115200
 Serial port: /dev/ttyRS485-1
 Use baud 115200
-    -> : 14 46 18 05 04 01 D7 01 01 69 EA
-    <- : 14 46 18 01 01 41 1C
+	-> : 14 46 18 05 04 01 D7 01 01 69 EA
+	<- : 14 46 18 01 01 41 1C
 
 ```
 
 Command parameters:
 
-- -D — output debugging, that is, bytes;
+- -D: Enable debugging (output raw bytes).
     
-- -b 115200 — bus speed;
+- -b 115200: Set bus speed to 115200 bps.
     
-- -i 20 — modbus address of the device;
+- -i 20: Modbus address of the device.
     
-- -r471 — 471 device register;
+- -r471: Device register – 471.
     
-- -t 4 — register type, Input;
+- -t 4: Register type (Input).
     
-- -c 1 — enable event with priority 1.
+- -c 1: Enable event with priority 1.
     
 
-If you now remove power from the device and apply it again, the event will be disabled; you need to turn it on again,if we need it. In the Wiren Board controller software, events are enabled by the wb-mqtt-serial driver, which turns on the necessary events automatically when it receives the “I rebooted” event from the device.
+If the device is rebooted, the event will be disabled and must be re-enabled. In the Wiren Board controller, the wb-mqtt-serial driver automatically enables necessary events upon receiving the “I rebooted” event from the device.
+When configuring events, note that not all registers in Wiren Board devices support events. This prevents spam from unimportant events, such as supply voltage changes. The registers that support events are documented for each device. The Wiren Board controller’s driver uses device templates to enable the appropriate events, so no manual configuration is required.
+When developing custom devices using the Fast Modbus extension, you can implement your own behavior, such as saving event settings across reboots or averaging values to avoid spam. The protocol imposes no restrictions.
 
-When setting up events, you need to take into account that not all registers of Wiren Board devices support events - this is done to avoid spam with unimportant events, such as changes in supply voltage. The register numbers for which events are available are described in the documentation for our devices. The driver in the Wiren Board controller has a device template indicating which events need to be enabled, so the user does not need to configure anything.
-
-Of course, when developing your devices using the Fast Modbus extension, you can implement your own behavior. For example, save event settings across reboots and somehow average values that are constantly changing to avoid spam. There are no restrictions at the protocol extension level.
-
-The master’s command sounds like this: “Device with address 20, enable an event for register 471 with priority 1.”
+The master would receive a command: “Device with address 20, enable an event for register 471 with priority 1.”
 
 Event Setup Command
 ```
 14 46 18 05 04 01 D7 01 01 69 EA
 ```
 
-- 0x14 — device address;
-    
-- 0x46 — control command for allowing event transmission;
-    
-- 0x18 — subcommand, event settings;
-    
-- 0x05 — the length of the settings list is 5 bytes;
-    
-- 0x04 — register type;
-    
-- 0x01 0xD7 0x01 — register address (big endian);
-    
-- 0x01 — number of registers in a row;
-    
-- 0x01 — event priority;
-    
-- 0x69 0xEA - checksum.
-    
+- 0x14: Device address (20).
+- 0x46: Command for enabling event transmission.
+- 0x18: Subcommand for event configuration.
+- 0x05: Length of the settings list (5 bytes).
+- 0x04: Register type (Input).
+- 0x01 0xD7 0x01: Register address (471 in big-endian).
+- 0x01: Number of consecutive registers.
+- 0x01: Event priority.
+- 0x69 0xEA: Checksum.
 
-In one request, you can enable events of several device registers at once, then the command will sound like this: “Device with address N, enable events in X registers, starting with register Y, and set such and such priorities for each.” 
-
-The device’s response to the command to change event settings sounds like this: “I am a device with address 20, I have enabled events with such and such priorities.”
+    
+Multiple registers can be configured in a single request by extending the settings list. The command would send this: “Device with address N, enable events in X registers, starting with register Y, and set such and such priorities for each.”
+The device’s response to the command to change event would send the following information: “I am a device with address 20, I have enabled events with such and such priorities.”
 
 Device response to event configuration command
 
@@ -705,20 +610,14 @@ Device response to event configuration command
 14 46 18 01 01 41 1C
 ```
 
-- 0x14 — device address.
-    
-- 0x46 — command to control the resolution of event transmission.
-    
-- 0x18 — subcommand for controlling the resolution of transmission of register value change events.
-    
-- 0x01 — length of the list of setting values.
-    
-- 0x01 - flags for allowing sending events, we configure one register, we have flag 1 - an event is enabled in one register.
-    
-- 0x41 0x1C — checksum.
-    
+- 0x14: Device address (20).
+- 0x46: Command for enabling event transmission.
+- 0x18: Subcommand for event configuration.
+- 0x01: Length of the settings list.
+- 0x01: Event enable flags (1 register enabled).
+- 0x41 0x1C: Checksum.
 
-In the response, the “register type”, “register address” and “number of registers in a row” fields are omitted, and the permission flags (priorities) are packed into bit masks.
+The response omits the register type, address, and count fields, packing the enable the permission flags (priorities) into bit masks.
 
 ![Event setting command and slave response](media/en/enable_event_w_priority.png "Event setting command and slave response")
 _Event setup command and slave response_
